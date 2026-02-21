@@ -200,6 +200,7 @@ e.g. `UTC' or `Europe/Berlin'. Nil for local OS timezone."
 (defvar-local pgmacs--offset nil)
 (defvar-local pgmacs--db-buffer nil)
 (defvar-local pgmacs--where-filter nil)
+(defvar-local pgmacs--order-by nil)
 (defvar-local pgmacs--marked-rows (list))
 (defvar-local pgmacs--completions nil)
 (defvar-local pgmacs--table-primary-keys nil)
@@ -476,6 +477,8 @@ Entering this mode runs the functions on `pgmacs-mode-hook'.
   "e"     #'pgmacs-run-sql
   "E"     #'pgmacs-run-buffer-sql
   "W"     #'pgmacs--add-where-filter
+  "s"     #'pgmacs--add-order-by-interactive
+  "M-s"   #'pgmacs--add-order-by
   "S"     #'pgmacs--schemaspy-table
   "T"     #'pgmacs--switch-to-database-buffer)
 
@@ -2958,6 +2961,7 @@ Opens a dedicated buffer if the query list is not empty."
               pgmacs--postgresql-keywords))))
 
 (defvar pgmacs--where-filter-history nil)
+(defvar pgmacs--order-by-history nil)
 
 ;; Bound to "W" in a row-list buffer.
 (defun pgmacs--add-where-filter (&rest _ignore)
@@ -2973,11 +2977,56 @@ Opens a dedicated buffer if the query list is not empty."
     (cond ((zerop (length filter))
            (message "Cancelling WHERE filter")
            (setq pgmacs--marked-rows (list))
-           (pgmacs--display-table pgmacs--table))
+           (pgmacs--display-table pgmacs--table :order-by pgmacs--order-by))
           (t
            (message "Using WHERE filter %s" filter)
            (setq pgmacs--marked-rows (list))
-           (pgmacs--display-table pgmacs--table :where-filter filter)))))
+           (pgmacs--display-table pgmacs--table :where-filter filter :order-by pgmacs--order-by)))))
+
+;; Bound to "M-s" in a row-list buffer.
+(defun pgmacs--add-order-by (&rest _ignore)
+  "Specify a raw ORDER BY clause to apply to the current PGmacs row-list buffer."
+  (interactive)
+  (unless (zerop pgmacs--offset)
+    (message "Resetting table OFFSET")
+    (sit-for 0.5))
+  (setq pgmacs--offset 0)
+  (let ((order-by (pgmacs--read-sql-minibuffer "ORDER BY: "
+                                               (pgmacs--completion-table)
+                                               'pgmacs--order-by-history)))
+    (when (cl-search ";" order-by)
+      (user-error "ORDER BY clause must not contain end-of-statement marker ';'"))
+    (let ((case-fold-search t))
+      (when (string-match-p "\\`[[:space:]]*ORDER[[:space:]]+BY[[:space:]]" order-by)
+        (user-error "ORDER BY clause should be specified without the ORDER BY keywords")))
+    (cond ((zerop (length order-by))
+           (message "Cancelling ORDER BY")
+           (setq pgmacs--marked-rows (list))
+           (pgmacs--display-table pgmacs--table :where-filter pgmacs--where-filter))
+          (t
+           (message "Using ORDER BY %s" order-by)
+           (setq pgmacs--marked-rows (list))
+           (pgmacs--display-table pgmacs--table :where-filter pgmacs--where-filter :order-by order-by)))))
+
+;; Bound to "s" in a row-list buffer.
+(defun pgmacs--add-order-by-interactive (&rest _ignore)
+  "Sort rows by choosing a column and direction (ASC/DESC)."
+  (interactive)
+  (unless (zerop pgmacs--offset)
+    (message "Resetting table OFFSET")
+    (sit-for 0.5))
+  (setq pgmacs--offset 0)
+  (save-excursion
+    (pgmacstbl-beginning-of-table)
+    (let* ((tbl (pgmacstbl-current-table))
+           (cols (and tbl (pgmacstbl-columns tbl)))
+           (col-names (mapcar #'pgmacstbl-column-name cols))
+           (col (completing-read "Order by column: " col-names nil t))
+           (direction (completing-read "Direction: " '("ASC" "DESC") nil t nil nil "ASC"))
+           (order-by (format "%s %s" (pg-escape-identifier col) direction)))
+      (message "Using ORDER BY %s" order-by)
+      (setq pgmacs--marked-rows (list))
+      (pgmacs--display-table pgmacs--table :where-filter pgmacs--where-filter :order-by order-by))))
 
 (defun pgmacs--paginated-next (&rest _ignore)
   "Move to the next page of the paginated PostgreSQL table."
@@ -3021,6 +3070,8 @@ Opens a dedicated buffer if the query list is not empty."
         (shwf 'pgmacs--next-item "Move to next column")
         (shwf 'pgmacs--edit-value-widget "Edit the value at point in a widget-based buffer")
         (shwf 'pgmacs--add-where-filter "Specify a WHERE filter to apply to displayed rows")
+        (shwf 'pgmacs--add-order-by-interactive "Sort rows by choosing a column and direction (ASC/DESC)")
+        (shwf 'pgmacs--add-order-by "Specify a raw ORDER BY clause to apply to displayed rows")
         (shwf 'pgmacs--row-list-delete-row "Delete the row at point")
         (shw "DEL" "Delete the row at point")
         (shwf 'pgmacs--insert-row "Insert a new row, prompting for new values in minibuffer")
@@ -3212,30 +3263,32 @@ Deletion is only possible for tables with a (possibly multicolumn) primary key."
     (pg-exec-prepared con sql params)))
 
 ;; Used to retrieve rows in a row-list buffer.
-(defun pgmacs--select-rows-offset (con table-name-escaped offset row-count)
-  (pcase (pgcon-server-variant con)
-    ;; YDB (as of 2025-03) triggers an error when using OFFSET without using LIMIT...
-    ('ydb
-     (let ((sql (format "SELECT * FROM %s LIMIT %s OFFSET %s"
-                        table-name-escaped row-count offset)))
-       (pg-exec con sql)))
-    ;; QuestDB does not support OFFSET.
-    ;; https://questdb.com/docs/reference/sql/limit/
-    ('questdb
-     (let ((sql (format "SELECT * FROM %s LIMIT %s,%s"
-                        table-name-escaped offset (+ offset row-count))))
-       (pg-exec con sql)))
-    (_
-     (let ((sql (format "SELECT * FROM %s OFFSET %s" table-name-escaped offset)))
-       (pg-exec-prepared con sql (list) :max-rows row-count)))))
+(defun pgmacs--select-rows-offset (con table-name-escaped offset row-count &optional order-by)
+  (let ((order-clause (if order-by (format " ORDER BY %s" order-by) "")))
+    (pcase (pgcon-server-variant con)
+      ;; YDB (as of 2025-03) triggers an error when using OFFSET without using LIMIT...
+      ('ydb
+       (let ((sql (format "SELECT * FROM %s%s LIMIT %s OFFSET %s"
+                          table-name-escaped order-clause row-count offset)))
+         (pg-exec con sql)))
+      ;; QuestDB does not support OFFSET.
+      ;; https://questdb.com/docs/reference/sql/limit/
+      ('questdb
+       (let ((sql (format "SELECT * FROM %s%s LIMIT %s,%s"
+                          table-name-escaped order-clause offset (+ offset row-count))))
+         (pg-exec con sql)))
+      (_
+       (let ((sql (format "SELECT * FROM %s%s OFFSET %s" table-name-escaped order-clause offset)))
+         (pg-exec-prepared con sql (list) :max-rows row-count))))))
 
-(defun pgmacs--select-rows-where (con table-name-escaped where-filter row-count)
+(defun pgmacs--select-rows-where (con table-name-escaped where-filter row-count &optional order-by)
   (when (cl-search ";" where-filter)
     (user-error "WHERE filter must not contain end-of-statement marker ';'"))
   (let ((case-fold-search t))
     (when (cl-search "WHERE" where-filter :test #'char-equal)
       (user-error "WHERE filter should be specified without the WHERE keyword")))
-  (let ((sql (format "SELECT * FROM %s WHERE %s" table-name-escaped where-filter)))
+  (let* ((order-clause (if order-by (format " ORDER BY %s" order-by) ""))
+         (sql (format "SELECT * FROM %s WHERE %s%s" table-name-escaped where-filter order-clause)))
     (pg-exec-prepared con sql (list) :max-rows row-count)))
 
 
@@ -3254,7 +3307,7 @@ Deletion is only possible for tables with a (possibly multicolumn) primary key."
 ;; Référencé par :
 ;; TABLE "book_author" CONSTRAINT "book_author_book_id_fkey" FOREIGN KEY (book_id) REFERENCES books(id)
 
-(cl-defun pgmacs--display-table (table &key center-on where-filter)
+(cl-defun pgmacs--display-table (table &key center-on where-filter order-by)
   "Open a row-list buffer to display TABLE in PGmacs.
 TABLE may be specified as a string or as a schema-qualified pg-qualified-name
 object.
@@ -3269,6 +3322,10 @@ Keyword argument WHERE-FILTER is an SQL WHERE clause which filters the
 rows to display in the table. The WHERE clause does not include the
 SQL keyword WHERE (example: `column_name > 0').
 
+Keyword argument ORDER-BY is an SQL ORDER BY clause (without the
+ORDER BY keywords) used to sort the displayed rows
+\(example: `column_name DESC').
+
 The CENTER-ON and WHERE-FILTER arguments are mutually exclusive.
 
 Runs functions on `pgmacs-row-list-hook'."
@@ -3282,7 +3339,8 @@ Runs functions on `pgmacs-row-list-hook'."
     (setq-local pgmacs--db-buffer db-buffer
                 ;; We need to save a possible WHERE filter, because if the user triggers a
                 ;; refetch+redraw of the table, we need to retain the filter.
-                pgmacs--where-filter where-filter)
+                pgmacs--where-filter where-filter
+                pgmacs--order-by order-by)
     (pgmacs--start-progress-reporter "Retrieving data from PostgreSQL")
     ;; Place some initial content in the buffer early up.
     (let* ((inhibit-read-only t)
@@ -3305,9 +3363,9 @@ Runs functions on `pgmacs-row-list-hook'."
            (res (cond (center-on
                        (pgmacs--select-rows-around con t-id center-on pgmacs-row-limit))
                       (where-filter
-                       (pgmacs--select-rows-where con t-id where-filter pgmacs-row-limit))
+                       (pgmacs--select-rows-where con t-id where-filter pgmacs-row-limit order-by))
                       (t
-                       (pgmacs--select-rows-offset con t-id offset pgmacs-row-limit))))
+                       (pgmacs--select-rows-offset con t-id offset pgmacs-row-limit order-by))))
            (rows (pg-result res :tuples))
            (column-names (mapcar #'cl-first (pg-result res :attributes)))
            (column-type-oids (mapcar #'cl-second (pg-result res :attributes)))
@@ -3475,7 +3533,12 @@ Runs functions on `pgmacs-row-list-hook'."
       ;; Make it visually clear to the user that a WHERE filter is active
       (when where-filter
         (insert (propertize "WHERE filter" 'face 'bold) ": ")
-        (insert (propertize where-filter 'face 'pgmacs-where-filter) "\n\n"))
+        (insert (propertize where-filter 'face 'pgmacs-where-filter) "\n"))
+      (when order-by
+        (insert (propertize "ORDER BY" 'face 'bold) ": ")
+        (insert (propertize order-by 'face 'pgmacs-where-filter) "\n"))
+      (when (or where-filter order-by)
+        (insert "\n"))
       (when pgmacs--offset
         (pgmacs-paginated-mode)
         (when (>= pgmacs--offset pgmacs-row-limit)
@@ -3529,6 +3592,7 @@ This refetches data from PostgreSQL and runs hooks on `pgmacs-row-list-hook'."
   (let ((table pgmacs--table)
         (offset pgmacs--offset)
         (where-filter pgmacs--where-filter)
+        (order-by pgmacs--order-by)
         (parent-buffer pgmacs--db-buffer))
     (kill-buffer)
     ;; We need to reset all row marks, because the PostgreSQL table may have seen changes since our
@@ -3538,7 +3602,7 @@ This refetches data from PostgreSQL and runs hooks on `pgmacs-row-list-hook'."
     ;; because this "parent" buffer holds buffer-local variables that we need to connect to
     ;; PostgreSQL.
     (with-current-buffer parent-buffer
-      (pgmacs--display-table table :where-filter where-filter)
+      (pgmacs--display-table table :where-filter where-filter :order-by order-by)
       (setq pgmacs--offset offset))
     (run-hooks 'pgmacs-row-list-hook)))
 
