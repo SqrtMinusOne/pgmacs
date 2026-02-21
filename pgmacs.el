@@ -687,7 +687,11 @@ Applies format string FMT to ARGS."
          (lambda (val)
            (concat "[" (string-join (mapcar #'prin1-to-string val) ",") "]")))
         (t
-         (lambda (val) (format "%s" val)))))
+         (lambda (val)
+           (let ((str (format "%s" val)))
+             (if (and (stringp str) (not (multibyte-string-p str)))
+                 (decode-coding-string str 'utf-8-unix)
+               str))))))
 
 (defun pgmacs--value-formatter (type-name)
   "Return a function that formats a value of type TYPE-NAME."
