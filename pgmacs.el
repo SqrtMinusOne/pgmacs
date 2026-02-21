@@ -494,6 +494,7 @@ Entering this mode runs the functions on `pgmacs-mode-hook'.
   "M-l"          #'pgmacs--downcase-value
   "M-c"          #'pgmacs--capitalize-value
   (kbd "v")      #'pgmacs--view-value
+  (kbd "V")      #'pgmacs--view-row-transposed
   "<delete>"     #'pgmacs--row-list-delete-row
   "<deletechar>" #'pgmacs--row-list-delete-row
   "<backspace>"  #'pgmacs--row-list-delete-row
@@ -1274,6 +1275,68 @@ has a primary key."
       (remove-overlays)
       (kill-all-local-variables)
       (insert value))
+    (setq-local pgmacs--db-buffer db-buffer)
+    (pgmacs-transient-mode)
+    (shrink-window-if-larger-than-buffer)
+    (setq buffer-read-only t)
+    (goto-char (point-min))))
+
+(defun pgmacs--view-row-transposed (&rest _ignore)
+  "Display current row in transposed format using pgmacstbl."
+  (interactive)
+  (let* ((db-buffer pgmacs--db-buffer)
+         (cols (pgmacstbl-columns (pgmacstbl-current-table)))
+         (current-row (or (pgmacstbl-current-object)
+                          (user-error "No row at point")))
+         (table-name (or pgmacs--table "query result"))
+         (buf (get-buffer-create (format "*PostgreSQL row: %s*" table-name)))
+
+         (data-rows (cl-loop for col in cols
+                             for i from 0
+                             for col-name = (pgmacstbl-column-name col)
+                             for val = (nth i current-row)
+                             for formatted = (funcall (pgmacstbl-column-formatter col) val)
+                             for displayer = (pgmacstbl-column-displayer col)
+                             for displayed = (if displayer
+                                                 (funcall displayer formatted pgmacs-max-column-width nil)
+                                               formatted)
+                             collect (list col-name displayed)))
+         (transposed-cols
+          (list
+           (make-pgmacstbl-column
+            :name (propertize "Column" 'face 'pgmacs-table-header)
+            :align 'left
+            :min-width 20
+            :getter (lambda (row &rest _) (car row)))
+
+           (make-pgmacstbl-column
+            :name (propertize "Value" 'face 'pgmacs-table-header)
+            :align 'left
+            :min-width 30
+            :getter (lambda (row &rest _) (cadr row)))))
+
+         (pgmacstbl (make-pgmacstbl
+                     :insert nil
+                     :use-header-line nil
+                     :face 'pgmacs-table-data
+                     :columns transposed-cols
+                     :row-colors pgmacs-row-colors
+                     :objects data-rows
+                     :keymap pgmacs-transient-map)))
+
+    (pop-to-buffer buf)
+    (let ((buffer-read-only nil))
+      (erase-buffer)
+      (remove-overlays)
+      (kill-all-local-variables)
+
+      (insert (propertize "Row Details (Transposed View)" 'face 'bold))
+      (insert "\n")
+      (insert (propertize (format "Table: %s" table-name) 'face 'italic))
+      (insert "\n\n")
+
+      (pgmacstbl-insert pgmacstbl))
+
     (setq-local pgmacs--db-buffer db-buffer)
     (pgmacs-transient-mode)
     (shrink-window-if-larger-than-buffer)
@@ -2869,6 +2932,7 @@ Opens a dedicated buffer if the query list is not empty."
       (let ((inhibit-read-only t))
         (erase-buffer)
         (shwf 'pgmacs--view-value "Display the value at point in a dedicated buffer")
+        (shwf 'pgmacs--view-row-transposed "Display the current row in transposed format (columns as rows)")
         (shwf 'pgmacs--row-list-dwim "Edit the value at point in the minibuffer")
         (shwf 'pgmacs--next-item "Move to next column")
         (shwf 'pgmacs--edit-value-widget "Edit the value at point in a widget-based buffer")
