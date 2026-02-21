@@ -29,6 +29,7 @@
 (require 'pgmacs-sql-keywords)
 (require 'pgmacs-schemaspy)
 (require 'pgmacs-chrome)
+(require 'pgmacs-sql)
 
 
 (declare-function csv-mode "csv-mode" ())
