@@ -794,10 +794,16 @@ If NEXT, do the next column."
   (pgmacstbl-header-mode 1))
 
 (defun pgmacstbl--limit-string (string pixels)
-  (while (and (length> string 0)
-              (> (string-pixel-width string) pixels))
-    (setq string (substring string 0 (1- (length string)))))
-  string)
+  (if (<= (string-pixel-width string) pixels)
+      string
+    (let ((lo 0)
+          (hi (length string)))
+      (while (> (- hi lo) 1)
+        (let ((mid (/ (+ lo hi) 2)))
+          (if (<= (string-pixel-width (substring string 0 mid)) pixels)
+              (setq lo mid)
+            (setq hi mid))))
+      (substring string 0 lo))))
 
 (defun pgmacstbl--char-width (table)
   (string-pixel-width (propertize "x" 'face (pgmacstbl-face table))))
