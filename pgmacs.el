@@ -1804,11 +1804,210 @@ over the PostgreSQL connection CON."
      (pgmacs--column-info/basic con table column))
     (_ (pgmacs--column-info/full con table column))))
 
+(defun pgmacs--all-columns-info/full (con table column-names column-type-oids)
+  "Return a hashtable mapping column name to column-info hashtable for all columns.
+Fetches metadata for all COLUMN-NAMES in TABLE using bulk queries instead of
+per-column queries.  COLUMN-TYPE-OIDS is a list of type OIDs corresponding to
+COLUMN-NAMES (from pg-result :attributes).  Uses PostgreSQL connection CON."
+  (let* ((schema (if (pg-qualified-name-p table)
+                     (pg-qualified-name-schema table)
+                   "public"))
+         (tname (if (pg-qualified-name-p table)
+                    (pg-qualified-name-name table)
+                  table))
+         (params `((,schema . "text") (,tname . "text")))
+         (argument-types (list "text" "text"))
+         ;; Constraints
+         (sql "SELECT tc.constraint_type, tc.constraint_name, c.column_name
+               FROM information_schema.table_constraints tc
+               JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
+               JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
+                 AND tc.table_name = c.table_name
+                 AND ccu.column_name = c.column_name
+               WHERE tc.constraint_schema = $1
+                 AND tc.table_name = $2
+                 AND tc.constraint_type != 'FOREIGN KEY'")
+         (ps-name (pg-ensure-prepared-statement con "QRY-all-check-constraints" sql argument-types))
+         (res (pg-fetch-prepared con ps-name params))
+         (all-check-constraints (pg-result res :tuples))
+         ;; FK references
+         (sql "SELECT
+                 $1,
+                 cl.relname AS parent_table,
+                 att.attname AS parent_column,
+                 conname,
+                 att2.attname AS child_column
+               FROM
+                (SELECT
+                     unnest(con1.conkey) AS parent,
+                     unnest(con1.confkey) AS child,
+                     con1.confrelid,
+                     con1.conrelid,
+                     con1.conname
+                 FROM
+                     pg_class cl
+                     JOIN pg_namespace ns ON cl.relnamespace = ns.oid
+                     JOIN pg_constraint con1 ON con1.conrelid = cl.oid
+                 WHERE
+                     ns.nspname = $1 AND
+                     cl.relname = $2 AND
+                     con1.contype = 'f'
+                ) con
+               JOIN pg_attribute att ON
+                    att.attrelid = con.confrelid and att.attnum = con.child
+               JOIN pg_class cl ON
+                    cl.oid = con.confrelid
+               JOIN pg_attribute att2 ON
+                    att2.attrelid = con.conrelid and att2.attnum = con.parent")
+         (ps-name (pg-ensure-prepared-statement con "QRY-all-references-constraints" sql argument-types))
+         (res (pg-fetch-prepared con ps-name params))
+         (all-references-constraints (pg-result res :tuples))
+         ;; Columns meta
+         (sql "SELECT column_name, character_maximum_length, column_default, is_nullable
+               FROM information_schema.columns
+               WHERE table_schema=$1 AND table_name=$2")
+         (ps-name (pg-ensure-prepared-statement con "QRY-all-columns-meta" sql argument-types))
+         (res (pg-fetch-prepared con ps-name params))
+         (all-columns-meta (pg-result res :tuples))
+         ;; Query 4: Column comments
+         (sql "SELECT a.attname, pg_catalog.col_description(a.attrelid, a.attnum)
+               FROM pg_catalog.pg_attribute a
+               WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped")
+         (t-id (pg-escape-identifier table))
+         (ps-name (pg-ensure-prepared-statement con "QRY-all-column-comments" sql (list "text")))
+         (res (pg-fetch-prepared con ps-name `((,t-id . "text"))))
+         (all-column-comments (pg-result res :tuples))
+         ;; Check clauses
+         (sql "SELECT cc.constraint_name, cc.check_clause
+               FROM information_schema.check_constraints cc
+               JOIN information_schema.table_constraints tc
+                 ON cc.constraint_schema = tc.constraint_schema
+                 AND cc.constraint_name = tc.constraint_name
+               WHERE tc.constraint_schema = $1
+                 AND tc.table_name = $2
+                 AND tc.constraint_type = 'CHECK'")
+         (ps-name (pg-ensure-prepared-statement con "QRY-all-check-clauses" sql argument-types))
+         (res (pg-fetch-prepared con ps-name params))
+         (all-check-clauses (pg-result res :tuples))
+         ;; Hash tables
+         (check-clauses-ht (make-hash-table :test #'equal))
+         (comments-ht (make-hash-table :test #'equal))
+         (meta-ht (make-hash-table :test #'equal))
+         ;; Check constraints by column name
+         (check-by-col (make-hash-table :test #'equal))
+         ;; FK references by column name
+         (refs-by-col (make-hash-table :test #'equal))
+         (result (make-hash-table :test #'equal)))
+
+    (dolist (row all-check-clauses)
+      (puthash (cl-first row) (cl-second row) check-clauses-ht))
+
+    (dolist (row all-column-comments)
+      (let ((comment (cl-second row)))
+        (unless (equal comment pg-null-marker)
+          (puthash (cl-first row) comment comments-ht))))
+
+    (dolist (row all-columns-meta)
+      (puthash (cl-first row) row meta-ht))
+
+    (dolist (row all-check-constraints)
+      (let ((col (cl-third row)))
+        (push (list (cl-first row) (cl-second row)) (gethash col check-by-col))))
+
+    (dolist (row all-references-constraints)
+      (let ((col (cl-fifth row)))
+        (push row (gethash col refs-by-col))))
+
+    ;; Agg loop
+    (cl-loop
+     for col in column-names
+     for oid in column-type-oids
+     do (let* ((column-info (make-hash-table :test #'equal))
+               (type-name (pg-lookup-type-name con oid))
+               (meta-row (gethash col meta-ht))
+               (maybe-maxlen (and meta-row (cl-second meta-row)))
+               (maxlen (if (equal pg-null-marker maybe-maxlen) nil maybe-maxlen))
+               (maybe-default (and meta-row (cl-third meta-row)))
+               (defaults (if (equal pg-null-marker maybe-default) nil maybe-default))
+               (maybe-nullable (and meta-row (cl-fourth meta-row)))
+               (nullable-p (equal "YES" maybe-nullable))
+               (col-checks (gethash col check-by-col))
+               (col-refs (gethash col refs-by-col))
+               (comment (gethash col comments-ht)))
+          (puthash "TYPE" (propertize type-name 'help-echo "The type of this column") column-info)
+
+          (dolist (c col-checks)
+            (cond ((string= "CHECK" (cl-first c))
+                   (let ((clause (gethash (cl-second c) check-clauses-ht)))
+                     (when clause
+                       (puthash (cl-first c) (format "%s %s" (cl-second c) clause) column-info))))
+                  (t
+                   (puthash (propertize (cl-first c) 'text-echo "Constraint type") (cl-second c) column-info))))
+
+          (when col-refs
+            (let* ((fc (cl-first col-refs))
+                   (target-col (and (eql 1 (length col-refs))
+                                    (cl-third fc))))
+              (let ((sqn (make-pg-qualified-name :schema (cl-first fc) :name (cl-second fc))))
+                (puthash "REFERENCES" (list sqn target-col) column-info))))
+
+          (when (not nullable-p)
+            (puthash (pgmacs--make-badge "NOT NULL" :color "#777" :help-echo "Not null constraint") nil column-info))
+
+          (when maxlen
+            (puthash "maxlen" maxlen column-info))
+
+          (when defaults
+            (puthash (propertize "DEFAULT" 'help-echo "Default value for this column") defaults column-info))
+
+          (when comment
+            (let* ((maybe-icon (pgmacs--maybe-svg-icon #'pgmacs--svg-icon-comment))
+                   (label (propertize (or maybe-icon "COMMENT") 'help-echo "Comment on this column")))
+              (puthash label comment column-info)))
+          (puthash "COLUMN-COMMENT" comment column-info)
+          (puthash col column-info result)))
+    result))
+
+(defun pgmacs--all-columns-info/basic (con table column-names column-type-oids)
+  "Return a hashtable mapping column name to column-info hashtable.
+
+Basic variant for database backends that don't support full PostgreSQL
+metadata queries.  Uses the passed-in COLUMN-TYPE-OIDS to avoid
+redundant type OID queries."
+  (let ((result (make-hash-table :test #'equal)))
+    (cl-loop
+     for col in column-names
+     for oid in column-type-oids
+     do (let* ((defaults (pg-column-default con table col))
+               (type-name (pg-lookup-type-name con oid))
+               (column-info (make-hash-table :test #'equal))
+               (comment (pg-column-comment con table col)))
+          (puthash "TYPE" type-name column-info)
+          (when defaults
+            (puthash "DEFAULT" defaults column-info))
+          (when comment
+            (puthash "COMMENT" comment column-info))
+          (puthash "COLUMN-COMMENT" comment column-info)
+          (puthash col column-info result)))
+    result))
+
+(defun pgmacs--all-columns-info (con table column-names column-type-oids)
+  "Return a hashtable mapping column name to column-info hashtable.
+Fetches metadata for all COLUMN-NAMES in TABLE in bulk.
+COLUMN-TYPE-OIDS is a list of type OIDs (from pg-result :attributes).
+Uses PostgreSQL connection CON.  Dispatches to a full or basic
+implementation based on the server variant."
+  (pcase (pgcon-server-variant con)
+    ((or 'cratedb 'questdb 'ydb 'materialize 'spanner 'risingwave)
+     (pgmacs--all-columns-info/basic con table column-names column-type-oids))
+    (_ (pgmacs--all-columns-info/full con table column-names column-type-oids))))
+
 ;; Format the column-info hashtable as a string for display
 (defun pgmacs--format-column-info (column-info)
   (let ((items (list)))
     (maphash (lambda (k v)
                (cond ((string= "TYPE" k) nil)
+                     ((string= "COLUMN-COMMENT" k) nil)
                      ((string= "REFERENCES" k)
                       (when (cl-second v)
                         (push (format "REFERENCES %s(%s)"
@@ -2965,11 +3164,7 @@ Runs functions on `pgmacs-row-list-hook'."
            (column-type-oids (mapcar #'cl-second (pg-result res :attributes)))
            (column-type-names (mapcar (lambda (oid) (pg-lookup-type-name con oid)) column-type-oids))
            (column-alignment (mapcar #'pgmacs--alignment-for column-type-names))
-           (column-info
-            (let ((ht (make-hash-table :test #'equal)))
-              (dolist (c column-names)
-                (puthash c (pgmacs--column-info con table c) ht))
-              ht))
+           (column-info (pgmacs--all-columns-info con table column-names column-type-oids))
            (column-meta (cl-loop
                          for c in column-names
                          for ci = (gethash c column-info)
@@ -3058,7 +3253,7 @@ Runs functions on `pgmacs-row-list-hook'."
                                                (pgmacs--display-table ,table)))
                                   'help-echo "Rename this column"))
             (insert "   ")
-            (cond ((pg-column-comment con table col)
+            (cond ((gethash "COLUMN-COMMENT" (gethash col column-info))
                    (insert-text-button
                     "Modify column comment"
                     'action `(lambda (&rest _ignore)
