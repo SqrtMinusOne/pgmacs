@@ -495,6 +495,7 @@ Entering this mode runs the functions on `pgmacs-mode-hook'.
   "M-c"          #'pgmacs--capitalize-value
   (kbd "v")      #'pgmacs--view-value
   (kbd "V")      #'pgmacs--view-row-transposed
+  (kbd "L")      #'pgmacs--view-linked-rows
   "<delete>"     #'pgmacs--row-list-delete-row
   "<deletechar>" #'pgmacs--row-list-delete-row
   "<backspace>"  #'pgmacs--row-list-delete-row
@@ -1347,6 +1348,56 @@ has a primary key."
     (setq buffer-read-only t)
     (goto-char (point-min))))
 
+(defun pgmacs--view-linked-rows (&rest _ignore)
+  "View rows in other tables that reference the current row via foreign keys."
+  (interactive)
+  (when (null pgmacs--table-primary-keys)
+    (user-error "Can't look up reverse references for a table with no PRIMARY KEY"))
+  (let* ((con pgmacs--con)
+         (table pgmacs--table)
+         (refs (pgmacs--reverse-fk-references con table))
+         (pgmacstbl (pgmacstbl-current-table))
+         (cols (pgmacstbl-columns pgmacstbl))
+         (current-row (or (pgmacstbl-current-object)
+                          (user-error "No row at point"))))
+    (when (null refs)
+      (user-error "No tables reference %s" (pgmacs--display-identifier table)))
+    ;; Each ref is (referencing-table referencing-schema referencing-column referenced-column)
+    (let* ((choices (mapcar (lambda (ref)
+                              (let ((rtable (cl-first ref))
+                                    (rschema (cl-second ref))
+                                    (rcol (cl-third ref))
+                                    (tcol (cl-fourth ref)))
+                                (cons (format "%s.%s (%s -> %s)" rschema rtable rcol tcol)
+                                      ref)))
+                            refs))
+           (chosen (if (eql 1 (length choices))
+                       (cdar choices)
+                     (let ((selection (completing-read "View referencing table: "
+                                                       choices nil t)))
+                       (cdr (assoc selection choices #'string=)))))
+           (ref-table (cl-first chosen))
+           (ref-schema (cl-second chosen))
+           (ref-col (cl-third chosen))
+           (target-col (cl-fourth chosen))
+           ;; Find the value in the current row for the referenced column
+           (col-pos (cl-position target-col cols
+                                 :key #'pgmacstbl-column-name :test #'string=))
+           (_ (unless col-pos
+                (user-error "Referenced column %s not found in current row" target-col)))
+           (col-type (aref pgmacs--column-type-names col-pos))
+           (pk-val (nth col-pos current-row))
+           ;; Build the WHERE filter using pg-serialize for proper value formatting
+           (ce (pgcon-client-encoding con))
+           (val-str (cond ((null pk-val) "NULL")
+                          ((numberp pk-val) (format "%s" pk-val))
+                          (t (format "'%s'" (pg-serialize pk-val col-type ce)))))
+           (where-filter (if (null pk-val)
+                             (format "%s IS NULL" (pg-escape-identifier ref-col))
+                           (format "%s = %s" (pg-escape-identifier ref-col) val-str)))
+           (sqn (make-pg-qualified-name :schema ref-schema :name ref-table)))
+      (pgmacs--display-table sqn :where-filter where-filter))))
+
 (defun pgmacs--row-list-delete-row (&rest _ignore)
   "Delete the row at point from the database table.
 Deletion is only possible when the table has primary key."
@@ -1733,6 +1784,34 @@ Uses PostgreSQL connection CON."
             (params `((,t-id . "text")))
             (ps-name (pg-ensure-prepared-statement con "QRY-table-fk-constraints" sql argument-types))
             (res (pg-fetch-prepared con ps-name params)))
+       (pg-result res :tuples)))
+    (_ nil)))
+
+(defun pgmacs--reverse-fk-references (con table)
+  "Return the list of tables that reference TABLE via foreign keys.
+Uses PostgreSQL connection CON.
+Each element is a list of (REFERENCING-TABLE REFERENCING-SCHEMA
+REFERENCING-COLUMN REFERENCED-COLUMN)."
+  (pcase (pgcon-server-variant con)
+    ((or 'postgresql 'orioledb 'ivorysql 'timescaledb 'citusdb 'xata)
+     (let* ((t-id (pg-escape-identifier table))
+            (sql "SELECT cl.relname AS referencing_table,
+                    ns.nspname AS referencing_schema,
+                    att.attname AS referencing_column,
+                    att2.attname AS referenced_column
+                  FROM pg_constraint c
+                  JOIN pg_class cl ON cl.oid = c.conrelid
+                  JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+                  JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = ANY(c.conkey)
+                  JOIN pg_attribute att2 ON att2.attrelid = c.confrelid AND att2.attnum = ANY(c.confkey)
+                  WHERE c.confrelid = $1::regclass
+                    AND c.contype = 'f'
+                  ORDER BY cl.relname, att.attname")
+            (argument-types (list "text"))
+            (params `((,t-id . "text")))
+            (ps-name (pg-ensure-prepared-statement con "QRY-reverse-fk-refs" sql argument-types))
+            (res (pg-fetch-prepared con ps-name params)))
+       ;; Each row is (referencing-table referencing-schema referencing-column referenced-column)
        (pg-result res :tuples)))
     (_ nil)))
 
@@ -2937,6 +3016,7 @@ Opens a dedicated buffer if the query list is not empty."
         (erase-buffer)
         (shwf 'pgmacs--view-value "Display the value at point in a dedicated buffer")
         (shwf 'pgmacs--view-row-transposed "Display the current row in transposed format (columns as rows)")
+        (shwf 'pgmacs--view-linked-rows "View rows in other tables that reference the current row (reverse FK)")
         (shwf 'pgmacs--row-list-dwim "Edit the value at point in the minibuffer")
         (shwf 'pgmacs--next-item "Move to next column")
         (shwf 'pgmacs--edit-value-widget "Edit the value at point in a widget-based buffer")
