@@ -2370,6 +2370,11 @@ Table names are schema-qualified if the schema is non-default."
   "Return a display function which echos ECHO-TEXT in minibuffer."
   (lambda (fvalue max-width _table)
     (let* ((first-line (pgmacs--truncate-multiline fvalue))
+           ;; Pre-truncate to avoid expensive pixel-width calculations on very long strings.
+           ;; No string longer than pgmacs-max-column-width characters can be fully displayed.
+           (first-line (if (> (length first-line) (* 2 pgmacs-max-column-width))
+                           (substring first-line 0 (* 2 pgmacs-max-column-width))
+                         first-line))
            (truncated (if (> (string-pixel-width first-line) max-width)
                           ;; TODO could include the ellipsis here
                           (pgmacstbl--limit-string first-line max-width)
