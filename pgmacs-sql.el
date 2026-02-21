@@ -14,7 +14,6 @@
 ;;; Code:
 
 (require 'sql)
-(require 'pgmacs)
 
 (defvar-local pgmacs-sql--connection nil
   "The pgmacs connection for this sql-mode buffer.
