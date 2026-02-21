@@ -3687,19 +3687,38 @@ Uses PostgreSQL connection CON."
                 buffer-read-only t
                 truncate-lines t))
   (pgmacs-mode)
-  (pgmacs--start-progress-reporter "Retrieving data from PostgreSQL")
-  ;; Insert initial content into buffer early.
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (remove-overlays)
-    (insert (propertize "PostgreSQL query output" 'face 'bold))
-    (insert "\n")
-    (insert (propertize "SQL" 'face 'bold))
-    (insert (format ": %s\n\n" sql)))
-  (let* ((res (pg-exec con sql)))
-    (pgmacs--show-pgresult (current-buffer) res))
-  (shrink-window-if-larger-than-buffer)
-  (pgmacs--stop-progress-reporter))
+  (unwind-protect
+      (progn
+        (pgmacs--start-progress-reporter "Retrieving data from PostgreSQL")
+        ;; Insert initial content into buffer early.
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (remove-overlays)
+          (insert (propertize "PostgreSQL query output" 'face 'bold))
+          (insert "\n")
+          (insert (propertize "SQL" 'face 'bold))
+          (insert (format ": %s\n\n" sql)))
+        (condition-case err
+            (let* ((res (pg-exec con sql)))
+              (pgmacs--show-pgresult (current-buffer) res))
+          ((error pg-error)
+           (let ((inhibit-read-only t))
+             (erase-buffer)
+             (insert (propertize "PostgreSQL Error" 'face 'error))
+             (insert "\n\n")
+             (insert (propertize "SQL Query:" 'face 'bold))
+             (insert "\n")
+             (insert sql)
+             (insert "\n\n")
+             (insert (propertize "Error:" 'face 'error))
+             (insert "\n")
+             (insert (error-message-string err))
+             (insert "\n")
+             (goto-char (point-min)))
+           (message "SQL execution failed: %s" (error-message-string err))))
+        (shrink-window-if-larger-than-buffer))
+    ;; This always runs, even if an error occurs
+    (pgmacs--stop-progress-reporter)))
 
 (defun pgmacs--show-pgresult (buffer pgresult)
   (with-current-buffer buffer
